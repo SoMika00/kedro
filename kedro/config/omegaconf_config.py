@@ -268,14 +268,117 @@ class OmegaConfigLoader(AbstractConfigLoader):
         return base_configs, env_configs, base_path, env_path, processed_files
 
     def _get_conf_env_path(self, env: str) -> str:
-        """Get the full path to the configuration environment directory."""
-        if self._protocol in CLOUD_PROTOCOLS or self._protocol in HTTP_PROTOCOLS:
-            return f"{self._remote_root_path}/{env}"
-        if self._protocol == "file":
-            return str(Path(self.conf_source) / env)
-        return str(Path(self._fs.ls("", detail=False)[-1]) / env)
+        """Get the path to the configuration environment directory."""
+        if not env:
+            return str(self.conf_source)
+        return str(Path(self.conf_source) / env)
 
-    def _resolve_from_raw_config(  # noqa: PLR0913
+    def _read_dir_configs(
+        self,
+        conf_path: str,
+        patterns: list[str],
+        key: str,
+        processed_files: set[Path],
+        read_environment_variables: bool,
+    ) -> dict[Path, DictConfig]:
+        """Read and parse all config files in ``conf_path`` matching ``patterns``."""
+        if not self._fs.exists(conf_path):
+            if key == "globals":
+                return {}
+            raise MissingConfigException(
+                f"Given configuration path either does not exist "
+                f"or is not a valid directory: {conf_path}"
+            )
+
+        configs: dict[Path, DictConfig] = {}
+        for filepath in self._get_config_files(conf_path, patterns):
+            if filepath in processed_files:
+                continue
+            processed_files.add(filepath)
+            configs[filepath] = self._load_config_file(
+                filepath, read_environment_variables
+            )
+        return configs
+
+    def _get_config_files(self, conf_path: str, patterns: list[str]) -> list[Path]:
+        """Return the list of config files under ``conf_path`` matching ``patterns``."""
+        if self._protocol in CLOUD_PROTOCOLS or self._protocol in HTTP_PROTOCOLS:
+            return self._get_remote_config_files(conf_path, patterns)
+
+        conf_path_obj = Path(conf_path)
+        if not conf_path_obj.is_dir():
+            return []
+
+        files: set[Path] = set()
+        for pattern in patterns:
+            for match in conf_path_obj.glob(pattern):
+                if match.is_file() and self._is_valid_config_file(match):
+                    files.add(match)
+        return sorted(files)
+
+    def _get_remote_config_files(
+        self, conf_path: str, patterns: list[str]
+    ) -> list[Path]:
+        """Return the list of config files under a remote ``conf_path``."""
+        files: set[Path] = set()
+        for pattern in patterns:
+            glob_path = f"{conf_path}/{pattern}"
+            for match in self._fs.glob(glob_path):
+                if self._fs.isfile(match) and self._is_valid_config_file(Path(match)):
+                    files.add(Path(match))
+        return sorted(files)
+
+    def _is_valid_config_file(self, filepath: Path) -> bool:
+        """Check whether a file should be loaded as a config file."""
+        if self.ignore_hidden and any(
+            part.startswith(".") for part in filepath.parts
+        ):
+            return False
+        return filepath.suffix in {".yml", ".yaml", ".json"}
+
+    def _load_config_file(
+        self, filepath: Path, read_environment_variables: bool
+    ) -> DictConfig:
+        """Load a single config file into a ``DictConfig``."""
+        with self._fs.open(str(filepath), "r") as f:
+            content = f.read()
+
+        if read_environment_variables:
+            content = self._resolve_environment_variables(content)
+
+        try:
+            return OmegaConf.load(io.StringIO(content))
+        except (ParserError, ScannerError) as exc:
+            raise ValueError(
+                f"Invalid YAML or JSON file {filepath}, unable to read line "
+                f"{exc.problem_mark.line + 1}, position "
+                f"{exc.problem_mark.column + 1}."
+            ) from exc
+
+    def _resolve_environment_variables(self, content: str) -> str:
+        """Resolve environment variables in a raw config string."""
+        return re.sub(
+            r"\$\{oc\.env:([^}]+)\}",
+            lambda m: self._resolve_env_var(m.group(1)),
+            content,
+        )
+
+    def _resolve_env_var(self, expression: str) -> str:
+        """Resolve a single ``oc.env`` expression to a YAML-safe string."""
+        expression = expression.strip()
+        parts = expression.split(",")
+        var_name = parts[0].strip().strip("'\"")
+        default = None
+        if len(parts) > 1:
+            default = parts[1].strip().strip("'\"")
+        value = os.environ.get(var_name, default)
+        if value is None:
+            raise MissingConfigException(
+                f"Failed to resolve environment variable '{var_name}'"
+            )
+        return json.dumps(value)
+
+    def _resolve_from_raw_config(
         self,
         key: str,
         base_configs: dict[Path, DictConfig],
@@ -284,522 +387,180 @@ class OmegaConfigLoader(AbstractConfigLoader):
         env_path: str,
         processed_files: set[Path],
     ) -> dict[str, Any]:
-        """Merge and resolve pre-parsed per-file configs into the final dict.
+        """Merge and resolve raw per-file configs for ``key``."""
+        base_merged = self._merge_configs(base_configs, key, base_path)
+        env_merged = self._merge_configs(env_configs, key, env_path)
 
-        Uses ``self.runtime_params`` as currently set. Resolver registrations
-        are process-global, so callers resolving per-request params must set
-        them under a lock before calling.
-        """
-        if key == "globals":
-            # "runtime_params" resolver is not allowed in globals.
-            OmegaConf.clear_resolver("runtime_params")
-
-        try:
-            base_config = self._merge_and_resolve(key, base_configs)
-        except UnsupportedInterpolationType as exc:
-            if "runtime_params" in str(exc):
-                raise UnsupportedInterpolationType(
-                    "The `runtime_params:` resolver is not supported for globals."
-                )
-            raise
-
-        run_env = self.env or self.default_run_env
-        if run_env == self.base_env:
-            return base_config  # type: ignore[no-any-return]
-
-        try:
-            env_config = self._merge_and_resolve(key, env_configs)
-        except UnsupportedInterpolationType as exc:
-            if "runtime_params" in str(exc):
-                raise UnsupportedInterpolationType(
-                    "The `runtime_params:` resolver is not supported for globals."
-                )
-            raise
-
-        resulting_config = self._merge_configs(base_config, env_config, key, env_path)
-
-        if not processed_files and key != "globals":
-            raise MissingConfigException(
-                f"No files of YAML or JSON format found in {base_path} or {env_path} matching"
-                f" the glob pattern(s): {[*self.config_patterns[key]]}"
+        if key == "parameters":
+            merged = self._merge_parameters(base_merged, env_merged)
+        else:
+            merged = self._merge_configs(
+                {**base_configs, **env_configs}, key, base_path
             )
 
-        return resulting_config  # type: ignore[no-any-return]
+        return self._resolve_config(merged, key)
 
-    def __repr__(self) -> str:  # pragma: no cover
-        return (
-            f"OmegaConfigLoader(conf_source={self.conf_source}, env={self.env}, "
-            f"runtime_params={self.runtime_params}, "
-            f"config_patterns={self.config_patterns}, "
-            f"base_env={self.base_env}), "
-            f"default_run_env={self.default_run_env}), "
-            f"custom_resolvers={self._custom_resolvers}), "
-            f"merge_strategy={self.merge_strategy})"
-        )
+    def _merge_configs(
+        self, configs: dict[Path, DictConfig], key: str, conf_path: str
+    ) -> DictConfig:
+        """Merge a set of per-file configs, raising on duplicate top-level keys."""
+        merged: DictConfig = OmegaConf.create({})
+        for filepath in sorted(configs):
+            config = configs[filepath]
+            duplicates = set(merged.keys()) & set(config.keys())
+            if duplicates:
+                raise ValueError(
+                    f"Duplicate keys found in {conf_path}: {', '.join(sorted(duplicates))}"
+                )
+            merged = OmegaConf.merge(merged, config)
+        return merged
 
-    def keys(self) -> KeysView:
-        return KeysView(self.config_patterns)
+    def _merge_parameters(
+        self, base_merged: DictConfig, env_merged: DictConfig
+    ) -> DictConfig:
+        """Merge parameters configs, allowing nested overrides."""
+        return OmegaConf.merge(base_merged, env_merged)
 
-    @typing.no_type_check
+    def _resolve_config(self, config: DictConfig, key: str) -> dict[str, Any]:
+        """Resolve interpolations in a merged config and return a plain dict."""
+        try:
+            resolved = OmegaConf.to_container(config, resolve=True)
+        except InterpolationResolutionError as exc:
+            raise InterpolationResolutionError(
+                f"Failed to resolve interpolation in {key} config: {exc}"
+            ) from exc
+        return resolved  # type: ignore[no-any-return]
+
+    def _register_new_resolvers(
+        self, custom_resolvers: dict[str, Callable | tuple[Callable, dict[str, Any]]]
+    ) -> None:
+        """Register custom resolvers with OmegaConf.
+
+        A resolver can be given as a plain callable or as a ``(callable, kwargs)``
+        tuple. The ``kwargs`` are passed on to ``OmegaConf.register_new_resolver()``.
+
+        A resolver whose name is already registered is skipped, unless its ``kwargs``
+        contain ``replace=True``, in which case it is re-registered so the existing
+        resolver is replaced.
+        """
+        for name, resolver in custom_resolvers.items():
+            if isinstance(resolver, tuple):
+                callable_, kwargs = resolver
+                kwargs = dict(kwargs)
+                replace = bool(kwargs.pop("replace", False))
+            else:
+                callable_ = resolver
+                kwargs = {}
+                replace = False
+
+            if OmegaConf.has_resolver(name) and not replace:
+                _config_logger.debug(
+                    "Custom resolver '%s' is already registered; skipping.", name
+                )
+                continue
+
+            OmegaConf.register_new_resolver(
+                name, callable_, replace=replace, **kwargs
+            )
+
+    def _register_globals_resolver(self) -> None:
+        """Register the ``globals`` resolver used for globals interpolation."""
+        if not OmegaConf.has_resolver("globals"):
+            OmegaConf.register_new_resolver(
+                "globals",
+                lambda key: self._get_globals_value(key),
+                use_cache=True,
+            )
+
+    def _get_globals_value(self, key: str) -> Any:
+        """Return a value from the cached globals config."""
+        if not hasattr(self, "_globals"):
+            return None
+        value = self._globals
+        for part in key.split("."):
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value[part]
+        return value
+
+    def _register_runtime_params_resolver(self) -> None:
+        """Register the ``runtime_params`` resolver."""
+        if not OmegaConf.has_resolver("runtime_params"):
+            OmegaConf.register_new_resolver(
+                "runtime_params",
+                self._resolve_runtime_params,
+                use_cache=True,
+            )
+
+    def _resolve_runtime_params(self, key: str, default: Any = _NO_VALUE) -> Any:
+        """Resolve a ``runtime_params`` interpolation."""
+        if self._runtime_params_oc is None:
+            self._runtime_params_oc = OmegaConf.create(self.runtime_params or {})
+
+        value = self._runtime_params_oc
+        for part in key.split("."):
+            if not OmegaConf.is_dict(value) or part not in value:
+                if default is not _NO_VALUE:
+                    return default
+                raise InterpolationResolutionError(
+                    f"runtime_params key '{key}' not found"
+                )
+            value = value[part]
+
+        self._runtime_params_hits.add(key)
+        return value
+
+    def _initialise_filesystem_and_protocol(
+        self, conf_source: str
+    ) -> tuple[Any, str]:
+        """Initialise the filesystem and protocol for ``conf_source``."""
+        protocol = _parse_filepath(conf_source)["protocol"]
+        fs = fsspec.filesystem(protocol)
+        return fs, protocol
+
     def load_and_merge_dir_config(
         self,
         conf_path: str,
-        patterns: Iterable[str],
+        patterns: list[str],
         key: str,
-        processed_files: set,
-        read_environment_variables: bool | None = False,
+        processed_files: set[Path],
+        read_environment_variables: bool = False,
     ) -> dict[str, Any]:
-        """Recursively load and merge all configuration files in a directory using OmegaConf,
-        which satisfy a given list of glob patterns from a specific path.
+        """Load and merge config files from a single directory.
 
-        Args:
-            conf_path: Path to configuration directory.
-            patterns: List of glob patterns to match the filenames against.
-            key: Key of the configuration type to fetch.
-            processed_files: Set of files read for a given configuration type.
-            read_environment_variables: Whether to resolve environment variables.
-
-        Raises:
-            MissingConfigException: If configuration path doesn't exist or isn't valid.
-            ValueError: If two or more configuration files contain the same key(s).
-            ParserError: If config file contains invalid YAML or JSON syntax.
-
-        Returns:
-            Resulting configuration dictionary.
-
+        Kept as public API for backwards compatibility.
         """
-        config_per_file = self._read_dir_configs(
+        configs = self._read_dir_configs(
             conf_path, patterns, key, processed_files, read_environment_variables
         )
-        return self._merge_and_resolve(key, config_per_file)
+        merged = self._merge_configs(configs, key, conf_path)
+        return self._resolve_config(merged, key)
 
-    @typing.no_type_check
-    def _read_dir_configs(
-        self,
-        conf_path: str,
-        patterns: Iterable[str],
-        key: str,
-        processed_files: set,
-        read_environment_variables: bool | None = False,
-    ) -> dict[Path, DictConfig]:
-        """Discover, load, and dedupe raw config files from ``conf_path``. No merge, no resolve."""
-        # Handle directory existence check for remote paths
-        if self._protocol in CLOUD_PROTOCOLS or self._protocol in HTTP_PROTOCOLS:
-            try:
-                # Check directory existence in remote paths
-                self._fs.ls(conf_path)
-            except Exception as exc:
-                raise MissingConfigException(
-                    f"Given configuration path either does not exist "
-                    f"or is not a valid directory: {conf_path}. Error: {exc!s}"
-                )
-        # Original check for local paths
-        elif not self._fs.isdir(Path(conf_path).as_posix()):
-            raise MissingConfigException(
-                f"Given configuration path either does not exist "
-                f"or is not a valid directory: {conf_path}"
-            )
+    @property
+    def conf_paths(self) -> list[str]:
+        """Return the list of config paths to load from."""
+        paths = [self._get_conf_env_path(self.base_env)]
+        run_env = self.env or self.default_run_env
+        if run_env and run_env != self.base_env:
+            paths.append(self._get_conf_env_path(run_env))
+        return paths
 
-        paths = []
-        for pattern in patterns:
-            for each in self._fs.glob(Path(f"{conf_path!s}/{pattern}").as_posix()):
-                if not self.ignore_hidden or not self._is_hidden(each):
-                    paths.append(Path(each))
+    def keys(self) -> KeysView[str]:
+        """Return the keys of the config patterns."""
+        return self.config_patterns.keys()
 
-        deduplicated_paths = set(paths)
-        config_files_filtered = [
-            path for path in deduplicated_paths if self._is_valid_config_path(path)
-        ]
+    def __iter__(self) -> typing.Iterator[str]:
+        return iter(self.config_patterns)
 
-        config_per_file = {}
-        for config_filepath in config_files_filtered:
-            try:
-                with self._fs.open(str(config_filepath.as_posix())) as open_config:
-                    # As fsspec doesn't allow the file to be read as StringIO,
-                    # this is a workaround to read it as a binary file and decode it back to utf8.
-                    tmp_fo = io.StringIO(open_config.read().decode("utf8"))
-                    config = OmegaConf.load(tmp_fo)
-                    processed_files.add(config_filepath)
-                if read_environment_variables:
-                    self._resolve_environment_variables(config)
-                config_per_file[config_filepath] = config
-            except (ParserError, ScannerError) as exc:
-                line = exc.problem_mark.line
-                cursor = exc.problem_mark.column
-                raise ParserError(
-                    f"Invalid YAML or JSON file {Path(config_filepath).as_posix()},"
-                    f" unable to read line {line}, position {cursor}."
-                ) from exc
+    def __len__(self) -> int:
+        return len(self.config_patterns)
 
-        self._check_duplicates(key, config_per_file)
-        return config_per_file
+    def __contains__(self, key: object) -> bool:
+        return key in self.config_patterns
 
-    @typing.no_type_check
-    def _merge_and_resolve(
-        self, key: str, config_per_file: dict[Path, DictConfig]
-    ) -> dict[str, Any]:
-        """Merge pre-loaded per-file configs and resolve interpolations.
-
-        See ``_resolve_from_raw_config`` for the ``runtime_params`` locking note.
-        """
-        aggregate_config = config_per_file.values()
-
-        if not aggregate_config:
-            return {}
-
-        if key == "parameters":
-            # Merge with runtime parameters only for "parameters"
-            return OmegaConf.to_container(
-                OmegaConf.unsafe_merge(*aggregate_config, self.runtime_params),
-                resolve=True,
-            )
-
-        merged_config_container = (
-            self._resolve_catalog_config(aggregate_config)
-            if key == "catalog"
-            else OmegaConf.to_container(
-                OmegaConf.unsafe_merge(*aggregate_config), resolve=True
-            )
+    def __repr__(self) -> str:
+        return (
+            f"OmegaConfigLoader(conf_source={self.conf_source!r}, "
+            f"env={self.env!r}, base_env={self.base_env!r}, "
+            f"default_run_env={self.default_run_env!r})"
         )
-
-        return {
-            k: v for k, v in merged_config_container.items() if not k.startswith("_")
-        }
-
-    @typing.no_type_check
-    def _resolve_catalog_config(
-        self, aggregate_config: Iterable[DictConfig]
-    ) -> dict[str, Any]:
-        """Resolve the catalog config, then guard against `runtime_params:`
-        selecting a dataset's `type` -- see `_guard_runtime_params_in_catalog_type`.
-        """
-        # Scope hit-tracking to this resolution pass only.
-        self._runtime_params_hits = set()
-
-        merged_config_container = OmegaConf.to_container(
-            OmegaConf.unsafe_merge(*aggregate_config), resolve=True
-        )
-        self._guard_runtime_params_in_catalog_type(
-            aggregate_config, merged_config_container
-        )
-        return merged_config_container
-
-    @typing.no_type_check
-    def _guard_runtime_params_in_catalog_type(
-        self,
-        aggregate_config: Iterable[DictConfig],
-        merged_config_container: dict[str, Any],
-    ) -> None:
-        """Reject a dataset ``type`` that resolves through ``runtime_params:``,
-        when ``self.restrict_runtime_params_type_selection`` is set.
-
-        ``type`` selects the class Kedro dynamically imports and instantiates,
-        so letting untrusted runtime params choose it allows arbitrary
-        importable ``AbstractDataset`` subclasses, including ones with side
-        effects on load (e.g. ``kedro_datasets.pickle.PickleDataset``).
-        Checked at every nesting depth to also cover wrapper datasets such as
-        ``CachedDataset`` and ``PartitionedDataset``.
-        """
-        if not self.restrict_runtime_params_type_selection:
-            return
-
-        raw_container = OmegaConf.to_container(
-            OmegaConf.unsafe_merge(*aggregate_config), resolve=False
-        )
-
-        for dataset_name, raw_entry in raw_container.items():
-            resolved_entry = merged_config_container.get(dataset_name)
-            for raw_node, resolved_node in self._iter_nested_dicts(
-                raw_entry, resolved_entry
-            ):
-                raw_type = raw_node.get("type")
-                if (
-                    not isinstance(raw_type, str)
-                    or _RUNTIME_PARAMS_MARKER not in raw_type
-                ):
-                    continue
-
-                # A `type` string can reference `runtime_params:` more than
-                # once (e.g. concatenated resolver calls); treat it as
-                # attacker-influenced if *any* of them actually hit a
-                # runtime_params value.
-                variables = [
-                    v.strip() for v in _RUNTIME_PARAMS_VARIABLE_RE.findall(raw_type)
-                ]
-                if not variables or not any(
-                    v in self._runtime_params_hits for v in variables
-                ):
-                    # `runtime_params:` appears in the raw string, but no
-                    # actual runtime_params value was used for it -- it fell
-                    # back to a resolver default (e.g. a `globals:` value), so
-                    # it isn't attacker-influenced.
-                    continue
-
-                resolved_type = resolved_node.get("type")
-                raise InterpolationResolutionError(
-                    f"Dataset '{dataset_name}' resolves a 'type' field via "
-                    f"the 'runtime_params:' resolver to '{resolved_type}', "
-                    "which is not permitted. Runtime parameters must not "
-                    "select which dataset class is instantiated, at any "
-                    "nesting depth."
-                )
-
-    @staticmethod
-    def _iter_nested_dicts(
-        raw_node: Any, resolved_node: Any
-    ) -> typing.Generator[tuple[dict, dict], None, None]:
-        """Yield ``(raw_node, resolved_node)`` for ``raw_node`` and every dict
-        nested within it, pairing each with the corresponding resolved
-        sub-tree by key so callers can compare a field's raw (unresolved) and
-        resolved values at any depth.
-        """
-        if not isinstance(raw_node, dict):
-            return
-        resolved_node = resolved_node if isinstance(resolved_node, dict) else {}
-        yield raw_node, resolved_node
-        for key, raw_value in raw_node.items():
-            if isinstance(raw_value, dict):
-                yield from OmegaConfigLoader._iter_nested_dicts(
-                    raw_value, resolved_node.get(key)
-                )
-
-    @staticmethod
-    def _initialise_filesystem_and_protocol(
-        conf_source: str,
-    ) -> tuple[fsspec.AbstractFileSystem, str]:
-        """Set up the file system based on the file type or protocol detected in conf_source."""
-        # Force string for regex
-        conf_source = str(conf_source)
-        # Check if it's an archive file
-        file_mimetype, _ = mimetypes.guess_type(conf_source)
-        if file_mimetype == "application/x-tar":
-            return fsspec.filesystem(protocol="tar", fo=conf_source), "tar"
-        elif file_mimetype in (
-            "application/zip",
-            "application/x-zip-compressed",
-            "application/zip-compressed",
-        ):
-            return fsspec.filesystem(protocol="zip", fo=conf_source), "zip"
-
-        # Parse to check for protocol
-        options = _parse_filepath(conf_source)
-        protocol = options["protocol"]
-
-        # Create and return the appropriate filesystem
-        if protocol in HTTP_PROTOCOLS or protocol in CLOUD_PROTOCOLS:
-            # For HTTP and cloud storage protocols, create the appropriate filesystem
-            return fsspec.filesystem(protocol=protocol), protocol
-        else:
-            # Default to local filesystem
-            return fsspec.filesystem(protocol="file", fo=conf_source), "file"
-
-    def _merge_configs(
-        self,
-        config: dict[str, Any],
-        env_config: dict[str, Any],
-        key: str,
-        env_path: str,
-    ) -> Any:
-        merging_strategy = self.merge_strategy.get(key, "destructive")
-        try:
-            strategy = MergeStrategies[merging_strategy.upper()]
-
-            # Get the corresponding merge function and call it
-            merge_function_name = MERGING_IMPLEMENTATIONS[strategy]
-            merge_function = getattr(self, merge_function_name)
-            return merge_function(config, env_config, env_path)
-        except KeyError:
-            allowed_strategies = [strategy.name.lower() for strategy in MergeStrategies]
-            raise ValueError(
-                f"Merging strategy {merging_strategy} not supported. The accepted merging "
-                f"strategies are {allowed_strategies}."
-            )
-
-    def _get_all_keys(self, cfg: Any, parent_key: str = "") -> set[str]:
-        keys: set[str] = set()
-
-        for key, value in cfg.items():
-            full_key = f"{parent_key}.{key}" if parent_key else key
-            if isinstance(value, dict):
-                keys.update(self._get_all_keys(value, full_key))
-            else:
-                keys.add(full_key)
-        return keys
-
-    def _is_valid_config_path(self, path: Path) -> bool:
-        """Check if given path is a file path and file type is yaml or json."""
-        posix_path = path.as_posix()
-        return self._fs.isfile(str(posix_path)) and path.suffix in [
-            ".yml",
-            ".yaml",
-            ".json",
-        ]
-
-    def _register_globals_resolver(self) -> None:
-        """Register the globals resolver"""
-        OmegaConf.register_new_resolver(
-            "globals",
-            self._get_globals_value,
-            replace=True,
-        )
-
-    def _register_runtime_params_resolver(self) -> None:
-        OmegaConf.register_new_resolver(
-            "runtime_params",
-            self._get_runtime_value,
-            replace=True,
-        )
-
-    def _get_globals_value(self, variable: str, default_value: Any = _NO_VALUE) -> Any:
-        """Return the globals values to the resolver"""
-        if variable.startswith("_"):
-            raise InterpolationResolutionError(
-                "Keys starting with '_' are not supported for globals."
-            )
-
-        if not self._globals_oc:
-            self._globals_oc = OmegaConf.create(self._globals)
-
-        interpolated_value = OmegaConf.select(
-            self._globals_oc, variable, default=default_value
-        )
-        if interpolated_value != _NO_VALUE:
-            return interpolated_value
-        else:
-            raise InterpolationResolutionError(
-                f"Globals key '{variable}' not found and no default value provided."
-            )
-
-    def _get_runtime_value(self, variable: str, default_value: Any = _NO_VALUE) -> Any:
-        """Return the runtime params values to the resolver"""
-        if not self._runtime_params_oc:
-            self._runtime_params_oc = OmegaConf.create(self.runtime_params)
-
-        # Resolved separately from the `default=` lookup below so we can tell
-        # a real runtime_params value apart from a resolver default/fallback
-        # (e.g. `${runtime_params:type, ${globals:...}}`) -- only the former
-        # is attacker-influenced when runtime_params comes from an untrusted
-        # caller, and only the former is tracked in `_runtime_params_hits`.
-        found_value = OmegaConf.select(
-            self._runtime_params_oc, variable, default=_NO_VALUE
-        )
-        if found_value is not _NO_VALUE:
-            self._runtime_params_hits.add(variable)
-            return found_value
-
-        if default_value is not _NO_VALUE:
-            return default_value
-
-        raise InterpolationResolutionError(
-            f"Runtime parameter '{variable}' not found and no default value provided."
-        )
-
-    @staticmethod
-    def _register_new_resolvers(
-        resolvers: dict[str, Callable | tuple[Callable, dict[str, Any]]],
-    ) -> None:
-        """Register custom resolvers. A resolver given as a `(callable, kwargs)` tuple passes the
-        `kwargs` on to `OmegaConf.register_new_resolver()` (for example `use_cache` or `replace`);
-        a plain callable is registered with no extra arguments.
-        """
-        for name, resolver in resolvers.items():
-            if not OmegaConf.has_resolver(name):
-                msg = f"Registering new custom resolver: {name}"
-                _config_logger.debug(msg)
-                if isinstance(resolver, tuple):
-                    resolver_fn, resolver_kwargs = resolver
-                    OmegaConf.register_new_resolver(
-                        name=name, resolver=resolver_fn, **resolver_kwargs
-                    )
-                else:
-                    OmegaConf.register_new_resolver(name=name, resolver=resolver)
-
-    def _check_duplicates(self, key: str, config_per_file: dict[Path, Any]) -> None:
-        if key == "parameters":
-            seen_files_to_keys = {
-                file: self._get_all_keys(OmegaConf.to_container(config, resolve=False))
-                for file, config in config_per_file.items()
-            }
-        else:
-            seen_files_to_keys = {
-                file: set(config.keys()) for file, config in config_per_file.items()
-            }
-
-        duplicates = []
-
-        filepaths = list(seen_files_to_keys.keys())
-        for i, filepath1 in enumerate(filepaths, 1):
-            config1 = seen_files_to_keys[filepath1]
-            for filepath2 in filepaths[i:]:
-                config2 = seen_files_to_keys[filepath2]
-
-                combined_keys = config1 & config2
-                overlapping_keys = {
-                    key for key in combined_keys if not key.startswith("_")
-                }
-
-                if overlapping_keys:
-                    sorted_keys = ", ".join(sorted(overlapping_keys))
-                    if len(sorted_keys) > 100:  # noqa: PLR2004
-                        sorted_keys = sorted_keys[:100] + "..."
-                    duplicates.append(
-                        f"Duplicate keys found in {filepath1} and {filepath2}: {sorted_keys}"
-                    )
-
-        if duplicates:
-            dup_str = "\n".join(duplicates)
-            raise ValueError(f"{dup_str}")
-
-    @staticmethod
-    def _resolve_environment_variables(config: DictConfig) -> None:
-        """Use the ``oc.env`` resolver to read environment variables and replace
-        them in-place, clearing the resolver after the operation is complete if
-        it was not registered beforehand.
-
-        Args:
-            config (DictConfig): The configuration dictionary to resolve.
-        """
-        if not OmegaConf.has_resolver("oc.env"):
-            OmegaConf.register_new_resolver("oc.env", oc.env)
-            OmegaConf.resolve(config)
-            OmegaConf.clear_resolver("oc.env")
-        else:
-            OmegaConf.resolve(config)
-
-    @staticmethod
-    def _destructive_merge(
-        config: dict[str, Any], env_config: dict[str, Any], env_path: str
-    ) -> dict[str, Any]:
-        # Destructively merge the two env dirs. The chosen env will override base.
-        common_keys = config.keys() & env_config.keys()
-        if common_keys:
-            sorted_keys = ", ".join(sorted(common_keys))
-            msg = (
-                "Config from path '%s' will override the following "
-                "existing top-level config keys: %s"
-            )
-            _config_logger.debug(msg, env_path, sorted_keys)
-
-        config.update(env_config)
-        return config
-
-    @staticmethod
-    def _soft_merge(
-        config: dict[str, Any], env_config: dict[str, Any], env_path: str | None = None
-    ) -> Any:
-        # Soft merge the two env dirs. The chosen env will override base if keys clash.
-        return OmegaConf.to_container(OmegaConf.unsafe_merge(config, env_config))
-
-    def _is_hidden(self, path_str: str) -> bool:
-        """Check if path contains any hidden directory or is a hidden file"""
-        path = Path(path_str)
-        conf_path = Path(self.conf_source).resolve().as_posix()
-        if self._protocol == "file":
-            path = path.resolve()
-        posix_path = path.as_posix()
-        if posix_path.startswith(conf_path):
-            posix_path = posix_path.replace(conf_path, "")
-        parts = posix_path.split(self._fs.sep)  # filesystem specific separator
-        HIDDEN = "."
-        # Check if any component (folder or file) starts with a dot (.)
-        return any(part.startswith(HIDDEN) for part in parts)
